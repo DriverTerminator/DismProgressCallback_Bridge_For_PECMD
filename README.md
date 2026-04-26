@@ -1,0 +1,2 @@
+# DismProgressCallback_Bridge_For_PECMD
+让dismapi回调可用于PECMD 2012的中间层
