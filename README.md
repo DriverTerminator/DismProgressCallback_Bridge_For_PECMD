@@ -31,6 +31,7 @@ typedef void (*DISM_PROGRESS_CALLBACK)(UINT, UINT, PVOID)
 所以参数不对齐，调用崩溃。
 
 此dll作为中间层转换，具体PECMD 2012调用代码如下：
+
 CALL $--ret:&hDismBridge ,-LoadLibrary,DismBridge.dll                       // 加载dll获取句柄
 ENVI^ WndProc1,&DismProgressCallback                                        // 绑定回调函数，获取函数地址，自动找 _SUB ONWndProc1 函数
 CALL $--qd %&hDismBridge%,SetCallback,#%&DismProgressCallback%              // PECMD 内部 WndProc 指针传给 DLL 保存
