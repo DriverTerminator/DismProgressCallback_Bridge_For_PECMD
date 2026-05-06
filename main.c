@@ -3,7 +3,8 @@
 //
 // 这个文件同时承担了 4 组职责：
 // 1. 保留原始 DismBridge 的“回调桥接”能力。
-// 2. 提供一个最小手工映射 DLL 加载器，绕过标准 LoadLibraryW 的导入阶段限制。
+// 2. 提供一个最小手工映射 DLL 加载器（LoadTargetLibraryW 第二参 profile 选策略，如 L"tbs.dll"），
+//    绕过标准 LoadLibraryW 的导入阶段限制。
 // 3. 在手工解析导入表时，定向劫持某些 NT5 不存在的 API。
 // 4. 为 bcrypt.dll 的若干哈希接口提供 NT5 可运行的兼容实现。
 //
@@ -135,12 +136,25 @@ typedef struct _MANUAL_IMPORT_MODULE
     struct _MANUAL_IMPORT_MODULE *Next;
 } MANUAL_IMPORT_MODULE;
 
+/*
+ * 手工加载画像（第二参 profile，宽字符串，如 L"tbs.dll"）：
+ * - 与“磁盘路径”解耦，用于选择导入劫持/补缺策略；
+ * - 仅实现已知画像；未知画像在 LoadTargetLibraryW 入口直接失败（ERROR_NOT_SUPPORTED）；
+ * - 比较规则：与 Windows 模块名习惯一致，忽略大小写（lstrcmpiW）。
+ */
+typedef enum _MANUAL_LOAD_PROFILE
+{
+    MANUAL_LOAD_PROFILE_NONE = 0,
+    MANUAL_LOAD_PROFILE_TBS_DLL = 1
+} MANUAL_LOAD_PROFILE;
+
 typedef struct _MANUAL_MODULE
 {
     HMODULE ModuleBase;
     PIMAGE_NT_HEADERS NtHeaders;
     DWORD ImageSize;
     MANUAL_IMPORT_MODULE *LoadedImports;
+    MANUAL_LOAD_PROFILE LoadProfile;
     struct _MANUAL_MODULE *Next;
 } MANUAL_MODULE;
 
@@ -165,6 +179,7 @@ static void RunTlsCallbacks(HMODULE moduleBase, PIMAGE_NT_HEADERS ntHeaders, DWO
 static FARPROC FindExportAddress(HMODULE moduleBase, LPCSTR procName, WORD ordinal, BOOL byOrdinal);
 static DWORD SectionCharacteristicsToProtect(DWORD characteristics);
 static BOOL NamesEqualInsensitiveA(LPCSTR left, LPCSTR right);
+static BOOL ResolveManualLoadProfileW(LPCWSTR profile, MANUAL_LOAD_PROFILE *outProfile);
 static BOOL IsMsvcrtExceptHandlerImport(LPCSTR moduleName, LPCSTR procName);
 static BOOL IsBcryptDestroyHashImport(LPCSTR moduleName, LPCSTR procName);
 static BOOL IsBcryptFinishHashImport(LPCSTR moduleName, LPCSTR procName);
@@ -615,18 +630,19 @@ BOOL WINAPI UnloadTargetLibrary(HMODULE moduleBase)
 
 /*
  * 手工加载入口：
- * 1. 读入整个目标 DLL 文件；
- * 2. 校验 PE 头；
- * 3. 手工映射镜像；
- * 4. 运行 TLS 回调；
- * 5. 调用 DllMain(DLL_PROCESS_ATTACH)；
- * 6. 返回“映射基址”作为宿主继续操作的句柄。
+ * 1. 校验 profile（第二参，宽字符串画像，如 L"tbs.dll"；未知画像失败并置 ERROR_NOT_SUPPORTED）；
+ * 2. 读入整个目标 DLL 文件；
+ * 3. 校验 PE 头；
+ * 4. 手工映射镜像；
+ * 5. 运行 TLS 回调；
+ * 6. 调用 DllMain(DLL_PROCESS_ATTACH)；
+ * 7. 返回“映射基址”作为宿主继续操作的句柄。
  *
  * 注意：
  * 返回值只是我们自己映射出来的模块基址，
  * 不是系统 loader 维护的 HMODULE，因此后续导出查询要用 GetMappedProcAddress。
  */
-HMODULE WINAPI LoadTargetLibraryW(LPCWSTR filePath)
+HMODULE WINAPI LoadTargetLibraryW(LPCWSTR filePath, LPCWSTR profile)
 {
     BYTE *buffer = NULL;
     DWORD size = 0;
@@ -634,10 +650,16 @@ HMODULE WINAPI LoadTargetLibraryW(LPCWSTR filePath)
     HMODULE moduleBase = NULL;
     PFN_DLL_ENTRY dllMain = NULL;
     MANUAL_MODULE *manualModule = NULL;
+    MANUAL_LOAD_PROFILE loadProfile = MANUAL_LOAD_PROFILE_NONE;
 
     if (!filePath || !filePath[0])
     {
         SetLastError(ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+
+    if (!ResolveManualLoadProfileW(profile, &loadProfile))
+    {
         return NULL;
     }
 
@@ -663,6 +685,8 @@ HMODULE WINAPI LoadTargetLibraryW(LPCWSTR filePath)
         SetLastError(ERROR_OUTOFMEMORY);
         return NULL;
     }
+
+    manualModule->LoadProfile = loadProfile;
 
     moduleBase = MapImageBuffer(buffer, ntHeaders, manualModule);
     LocalFree(buffer);
@@ -1019,6 +1043,8 @@ static FARPROC ResolveImportedProc(MANUAL_MODULE *manualModule, LPCSTR moduleNam
     HMODULE importModule;
     BOOL loadedNow;
 
+    if (manualModule && manualModule->LoadProfile == MANUAL_LOAD_PROFILE_TBS_DLL)
+    {
     if (IsMsvcrtExceptHandlerImport(moduleName, procName))
     {
         UNREFERENCED_PARAMETER(manualModule);
@@ -1073,6 +1099,8 @@ static FARPROC ResolveImportedProc(MANUAL_MODULE *manualModule, LPCSTR moduleNam
         UNREFERENCED_PARAMETER(manualModule);
         UNREFERENCED_PARAMETER(ordinal);
         return (FARPROC)BCryptCloseAlgorithmProvider;
+    }
+
     }
 
     loadedNow = FALSE;
@@ -1403,6 +1431,38 @@ static BOOL NamesEqualInsensitiveA(LPCSTR left, LPCSTR right)
             return TRUE;
         }
     }
+}
+
+/*
+ * 解析第二参 profile：必须是已登记的模块画像名（当前仅支持 L"tbs.dll"）。
+ * - 空指针或空串：ERROR_INVALID_PARAMETER；
+ * - 未实现的画像：ERROR_NOT_SUPPORTED；
+ * - 匹配成功：写出 MANUAL_LOAD_PROFILE，比较忽略大小写（lstrcmpiW）。
+ */
+static BOOL ResolveManualLoadProfileW(LPCWSTR profile, MANUAL_LOAD_PROFILE *outProfile)
+{
+    if (!outProfile)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    *outProfile = MANUAL_LOAD_PROFILE_NONE;
+
+    if (!profile || !profile[0])
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if (lstrcmpiW(profile, L"tbs.dll") == 0)
+    {
+        *outProfile = MANUAL_LOAD_PROFILE_TBS_DLL;
+        return TRUE;
+    }
+
+    SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
 }
 
 /*
