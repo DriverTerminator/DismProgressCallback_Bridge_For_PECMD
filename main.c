@@ -14,7 +14,18 @@
 // - 因此改为“手工映射 + 导入替换 + 本地兼容实现”的思路。
 
 #include <windows.h>
+#include <excpt.h>
 #include <stddef.h>
+
+#if defined(_M_IX86)
+EXCEPTION_DISPOSITION __cdecl _except_handler4_common(
+    PUINT_PTR cookiePointer,
+    void *cookieCheckFunction,
+    PEXCEPTION_RECORD exceptionRecord,
+    void *establisherFrame,
+    PCONTEXT contextRecord,
+    PVOID dispatcherContext);
+#endif
 
 /*
  * 老工具链 / 老 SDK 里不一定带有较新的 NTSTATUS 常量和 SHA2 算法常量。
@@ -217,19 +228,27 @@ PVOID WINAPI GetDismCallback(void)
 }
 
 /*
- * 兼容 msvcrt!_except_handler4_common：
- *
- * 某些较新的 VC 构建产物在 NT5 上加载时，会因为 msvcrt.dll 缺少
- * _except_handler4_common 而在“导入解析阶段”直接失败。
- *
- * 这里提供的是一个“最小导出占位”：
- * - 目的：先让模块跨过导入期，保证手工加载流程能继续。
- * - 限制：这并不是完整 CRT 异常分发实现，不能等价替代新系统上的真实版本。
+ * msvcrt!_except_handler4_common：
+ * Win32 下的完整实现见 eh4_x86.c（仅 Win32 平台参与编译）。
  */
-int __cdecl _except_handler4_common(void)
+#if !defined(_M_IX86)
+EXCEPTION_DISPOSITION __cdecl _except_handler4_common(
+    PUINT_PTR cookiePointer,
+    void *cookieCheckFunction,
+    PEXCEPTION_RECORD exceptionRecord,
+    void *establisherFrame,
+    PCONTEXT contextRecord,
+    PVOID dispatcherContext)
 {
+    (void)cookiePointer;
+    (void)cookieCheckFunction;
+    (void)exceptionRecord;
+    (void)establisherFrame;
+    (void)contextRecord;
+    (void)dispatcherContext;
     return ExceptionContinueSearch;
 }
+#endif
 
 /*
  * BCryptDestroyHash:
